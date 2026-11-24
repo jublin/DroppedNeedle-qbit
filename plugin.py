@@ -1,6 +1,10 @@
-"""qBittorrent download client for DroppedNeedle.
+"""Prowlarr indexer + qBittorrent download client for DroppedNeedle.
 
-Sends the torrent or magnet link an indexer supplies (``EnqueueRequest.payload``)
+Search: ``search_album`` queries Prowlarr's torrent indexers and returns each
+release with the magnet link / .torrent URL as its payload, scored and tiered
+so DroppedNeedle's own quality settings and import pipeline apply on top.
+
+Download: sends the torrent or magnet link an indexer supplies (``EnqueueRequest.payload``)
 to qBittorrent's Web API v2, always setting the configured category (default
 ``music``). Torrents are identified by a per-task tag, so the plugin keeps no
 state and survives restarts. Folder mode: the finished files are discovered
@@ -18,7 +22,9 @@ from droppedneedle_plugin import (
     DownloadMaterialization,
     DownloadTaskStatus,
     EnqueueRequest,
+    IndexerResult,
     MountDiagnosis,
+    PluginSearchResult,
     ServiceStatus,
     TaskHandle,
 )
@@ -33,6 +39,25 @@ _FAILED_UNKNOWN = {"error"}
 _QUEUED = {"queuedDL", "checkingResumeData", "allocating"}
 _MOVING = {"moving"}
 _BTIH = re.compile(r"xt=urn:btih:([^&]+)", re.IGNORECASE)
+
+DEFAULT_PROWLARR_CATEGORIES = "3000"  # Newznab "Audio"
+MAX_RESULTS = 100
+# Checked in order; first hit wins.
+_TIERS = (
+    ("lossless", re.compile(r"flac|alac|lossless|\bwav\b|\bape\b|\bdsd|24[ -]?bit", re.I)),
+    ("mp3_320", re.compile(r"\b320\b", re.I)),
+    ("mp3_256", re.compile(r"\bv0\b|\b256\b", re.I)),
+    ("mp3_192", re.compile(r"\bv2\b|\b192\b", re.I)),
+    ("low", re.compile(r"\b(128|96|64)\b", re.I)),
+)
+
+
+def quality_tier(title: str) -> str:
+    """Best-effort audio quality tier from a release title, '' when unknown."""
+    for tier, pattern in _TIERS:
+        if pattern.search(title or ""):
+            return tier
+    return ""
 
 
 def _text(value) -> str:
@@ -61,6 +86,18 @@ class QBittorrent:
 
     def is_configured(self) -> bool:
         return bool(self._base_url())
+
+    def _prowlarr_url(self) -> str:
+        url = self._setting("prowlarr_url").rstrip("/")
+        if url and "://" not in url:
+            url = "http://" + url
+        return url
+
+    def _min_seeders(self) -> int:
+        try:
+            return max(0, int(self._setting("min_seeders") or 1))
+        except ValueError:
+            return 1
 
     # -- HTTP -----------------------------------------------------------
 
@@ -187,7 +224,107 @@ class QBittorrent:
                 message=f"downloads directory not found: {downloads}",
                 version=response.text.strip(),
             )
+        if self._prowlarr_url():
+            problem = await self._prowlarr_problem()
+            if problem:
+                return ServiceStatus(status="error", message=problem, version=response.text.strip())
         return ServiceStatus(status="ok", version=response.text.strip())
+
+    async def _prowlarr_problem(self) -> str:
+        """'' when Prowlarr answers with the configured API key, else why not."""
+        try:
+            response = await self.ctx.http.get(
+                f"{self._prowlarr_url()}/api/v1/system/status",
+                headers={"X-Api-Key": self._setting("prowlarr_api_key")},
+                timeout=10.0,
+            )
+        except OSError as exc:
+            return f"cannot reach Prowlarr at {self._prowlarr_url()}: {exc}"
+        if response.status_code in (401, 403):
+            return "Prowlarr rejected the API key"
+        if response.status_code != 200:
+            return f"Prowlarr answered HTTP {response.status_code}"
+        return ""
+
+    # -- indexer (Prowlarr) ---------------------------------------------
+
+    async def search_album(
+        self,
+        artist_name: str,
+        album_title: str,
+        year: int | None = None,
+        track_count: int | None = None,
+        *,
+        timeout: float = 30.0,
+    ) -> list[IndexerResult]:
+        if not self._prowlarr_url() or not self._setting("prowlarr_api_key"):
+            return []
+        query = f"{artist_name or ''} {album_title or ''}".strip()
+        if not query:
+            return []
+        try:
+            async with asyncio.timeout(timeout):
+                response = await self.ctx.http.get(
+                    f"{self._prowlarr_url()}/api/v1/search",
+                    params={
+                        "query": query,
+                        "type": "search",
+                        "categories": [
+                            c.strip()
+                            for c in (self._setting("prowlarr_categories") or DEFAULT_PROWLARR_CATEGORIES).split(",")
+                            if c.strip()
+                        ],
+                    },
+                    headers={"X-Api-Key": self._setting("prowlarr_api_key")},
+                    timeout=timeout,
+                )
+            if response.status_code != 200:
+                self.ctx.logger.warning("Prowlarr search answered HTTP %s", response.status_code)
+                return []
+            releases = response.json()
+        except Exception as exc:  # noqa: BLE001 - one bad search is [], never a crash
+            self.ctx.logger.warning("Prowlarr search failed: %s", exc)
+            return []
+
+        min_seeders = self._min_seeders()
+        scored = []
+        for release in releases if isinstance(releases, list) else []:
+            if str(release.get("protocol", "torrent")).lower() != "torrent":
+                continue
+            seeders = int(release.get("seeders") or 0)
+            link = release.get("magnetUrl") or release.get("downloadUrl") or ""
+            if not link or seeders < min_seeders:
+                continue
+            title = str(release.get("title") or "")
+            score = self.ctx.scoring.album_match(artist_name or "", album_title or "", title)
+            if year and str(year) in title:
+                score += 0.05
+            scored.append(
+                (
+                    min(score, 1.0),
+                    seeders,
+                    PluginSearchResult(
+                        title=title,
+                        size_bytes=int(release.get("size") or 0),
+                        score=round(min(score, 1.0), 4),
+                        quality_tier=quality_tier(title),
+                        payload=link,
+                    ),
+                )
+            )
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [IndexerResult(source=SOURCE, plugin=item[2]) for item in scored[:MAX_RESULTS]]
+
+    async def search_track(
+        self,
+        artist_name: str,
+        track_title: str,
+        album_title: str | None = None,
+        duration_seconds: int | None = None,
+        *,
+        timeout: float = 30.0,
+    ) -> list[IndexerResult]:
+        return []  # torrents are albums; single tracks are not searched
 
     # -- download client ------------------------------------------------
 

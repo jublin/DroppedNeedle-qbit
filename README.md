@@ -1,8 +1,17 @@
-# DroppedNeedle qBittorrent plugin
+# DroppedNeedle Prowlarr + qBittorrent plugin
 
-A [DroppedNeedle](https://github.com/DroppedNeedle/DroppedNeedle) download client
-(`plugin:qbittorrent`) that sends torrents and magnet links to qBittorrent and
-**always sets the category to `music`** (configurable; created if missing).
+A [DroppedNeedle](https://github.com/DroppedNeedle/DroppedNeedle) plugin
+(`plugin:qbittorrent`) that:
+
+1. **Searches** torrent indexers through Prowlarr (`indexer` capability).
+2. **Sends** the chosen torrent or magnet link to qBittorrent, **always setting
+   the category to `music`** (configurable; created if missing).
+3. **Monitors** progress and completion, then hands the finished files to
+   DroppedNeedle's normal import pipeline (`download_client` capability).
+
+Results carry a score and a quality tier (`lossless`, `mp3_320`, ...) inferred
+from the release title, so DroppedNeedle's own quality settings, score
+thresholds and source priority decide what downloads automatically.
 
 ## Install
 
@@ -12,6 +21,9 @@ settings.
 
 | Setting | Meaning |
 |---|---|
+| Prowlarr URL / API key | Prowlarr address and key (Settings > General). Leave empty to use a different indexer plugin |
+| Prowlarr categories | Newznab ids, default `3000` (Audio) |
+| Minimum seeders | Default `1` |
 | qBittorrent URL | Web UI address, e.g. `http://qbittorrent:8080` |
 | Username / Password | Web UI credentials (leave empty if auth is bypassed) |
 | Category | Defaults to `music` |
@@ -21,9 +33,13 @@ settings.
 
 ## How it works
 
-- It is a download client only. A torrent indexer plugin supplies the results:
-  set its `target_source = "plugin:qbittorrent"` and put a magnet link or
-  `.torrent` URL in `PluginSearchResult.payload`.
+- Only torrent results (not usenet) are returned; the payload is the magnet
+  link, or Prowlarr's `.torrent` download URL when there is none. In that case
+  qBittorrent must be able to reach the Prowlarr address you configured.
+- Another indexer plugin can still feed this client: set its
+  `target_source = "plugin:qbittorrent"` and put a magnet link or `.torrent`
+  URL in the result payload.
+- Track-level search is not supported (torrents are albums).
 - Each torrent gets a `droppedneedle-<task id>` tag, which is how later status
   calls find it. The plugin keeps no state.
 - Folder mode: when the torrent finishes, the files qBittorrent reports are
