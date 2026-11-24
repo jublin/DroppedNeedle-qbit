@@ -1,0 +1,49 @@
+[plugin]
+name = "qbittorrent"
+display_name = "qBittorrent"
+version = "1.0.0"
+api_version = 2
+entrypoint = "plugin:QBittorrent"
+capabilities = ["download_client"]
+description = "Download client that sends torrents and magnet links to qBittorrent, in the music category."
+author = "Justin Moore"
+
+[[capability]]
+id = "download_client"
+display_name = "qBittorrent"
+
+[[settings]]
+key = "url"
+label = "qBittorrent URL"
+help = "Web UI address, e.g. http://qbittorrent:8080"
+
+[[settings]]
+key = "username"
+label = "Username"
+help = "Web UI username. Leave empty if localhost/subnet authentication is bypassed."
+
+[[settings]]
+key = "password"
+label = "Password"
+help = "Web UI password."
+secret = true
+
+[[settings]]
+key = "category"
+label = "Category"
+help = "Category set on every torrent DroppedNeedle adds. Created if missing. Defaults to music."
+
+[[settings]]
+key = "downloads_dir"
+label = "Downloads directory"
+help = "Where DroppedNeedle sees qBittorrent's completed downloads (the category's save path). Finished files must be inside this folder."
+
+[[settings]]
+key = "remote_path"
+label = "qBittorrent path (optional)"
+help = "The same folder as qBittorrent sees it, if the paths differ (e.g. /downloads when DroppedNeedle mounts it at /data/music-dl). Leave empty if both see the same path."
+
+[[settings]]
+key = "discard_action"
+label = "When a download is discarded"
+help = "keep, remove (torrent only, default) or remove_with_files. Applies after import or failure; aborted downloads always delete their partial files."
