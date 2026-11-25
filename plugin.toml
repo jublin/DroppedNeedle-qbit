@@ -1,7 +1,7 @@
 [plugin]
 name = "qbittorrent"
 display_name = "Prowlarr + qBittorrent"
-version = "1.1.1"
+version = "1.1.2"
 api_version = 2
 entrypoint = "plugin:QBittorrent"
 capabilities = ["download_client", "indexer"]

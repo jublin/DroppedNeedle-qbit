@@ -52,6 +52,19 @@ _TIERS = (
 )
 
 
+def _query_variants(artist: str, album: str) -> list[str]:
+    """Search strings, most specific first: 'artist album', then the album with
+    edition tags / punctuation removed ('Album (Deluxe Edition)' -> 'Album')."""
+    cleaned = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", album)
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned)
+    variants = []
+    for album_part in (album, " ".join(cleaned.split())):
+        query = f"{artist} {album_part}".strip()
+        if query and query not in variants:
+            variants.append(query)
+    return variants
+
+
 def quality_tier(title: str) -> str:
     """Best-effort audio quality tier from a release title, '' when unknown."""
     for tier, pattern in _TIERS:
@@ -262,6 +275,41 @@ class QBittorrent:
 
     # -- indexer (Prowlarr) ---------------------------------------------
 
+    async def _prowlarr_search(self, query: str, categories: list[str], timeout: float) -> list[dict]:
+        params = {"query": query, "type": "search"}
+        if categories:
+            params["categories"] = categories
+        response = await self.ctx.http.get(
+            f"{self._prowlarr_url()}/api/v1/search",
+            params=params,
+            headers={"X-Api-Key": self._setting("prowlarr_api_key")},
+            timeout=timeout,
+        )
+        if response.status_code in (401, 403):
+            raise RuntimeError("Prowlarr rejected the API key")
+        if response.status_code != 200:
+            raise RuntimeError(f"Prowlarr answered HTTP {response.status_code}")
+        found = response.json()
+        return found if isinstance(found, list) else []
+
+    async def _search_variants(self, queries: list[str], categories: list[str], timeout: float) -> list[dict]:
+        """Run the queries concurrently; one failing query does not sink the others."""
+        outcomes = await asyncio.gather(
+            *(self._prowlarr_search(q, categories, timeout) for q in queries), return_exceptions=True
+        )
+        merged, seen = [], set()
+        for query, outcome in zip(queries, outcomes):
+            if isinstance(outcome, BaseException):
+                self.ctx.logger.warning("Prowlarr search %r failed: %s", query, outcome)
+                continue
+            self.ctx.logger.info("Prowlarr search %r (categories=%s): %d raw result(s)", query, categories or "any", len(outcome))
+            for release in outcome:
+                key = release.get("guid") or release.get("magnetUrl") or release.get("downloadUrl") or id(release)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(release)
+        return merged
+
     async def search_album(
         self,
         artist_name: str,
@@ -272,61 +320,71 @@ class QBittorrent:
         timeout: float = 30.0,
     ) -> list[IndexerResult]:
         if not self._prowlarr_url() or not self._setting("prowlarr_api_key"):
+            self.ctx.logger.info("Prowlarr is not configured; skipping search")
             return []
-        query = f"{artist_name or ''} {album_title or ''}".strip()
-        if not query:
+        artist, album = (artist_name or "").strip(), (album_title or "").strip()
+        queries = _query_variants(artist, album)
+        if not queries:
             return []
+        categories = [
+            c.strip()
+            for c in (self._setting("prowlarr_categories") or DEFAULT_PROWLARR_CATEGORIES).split(",")
+            if c.strip()
+        ]
         try:
             async with asyncio.timeout(timeout):
-                response = await self.ctx.http.get(
-                    f"{self._prowlarr_url()}/api/v1/search",
-                    params={
-                        "query": query,
-                        "type": "search",
-                        "categories": [
-                            c.strip()
-                            for c in (self._setting("prowlarr_categories") or DEFAULT_PROWLARR_CATEGORIES).split(",")
-                            if c.strip()
-                        ],
-                    },
-                    headers={"X-Api-Key": self._setting("prowlarr_api_key")},
-                    timeout=timeout,
-                )
-            if response.status_code != 200:
-                self.ctx.logger.warning("Prowlarr search answered HTTP %s", response.status_code)
-                return []
-            releases = response.json()
+                releases = await self._search_variants(queries, categories, timeout)
+                if not releases and categories:
+                    # Some indexers file music under odd categories: retry unfiltered.
+                    releases = await self._search_variants(queries, [], timeout)
+        except TimeoutError:
+            self.ctx.logger.warning(
+                "Prowlarr search for %r timed out after %.0fs (slow indexers? disable them in Prowlarr)", queries[0], timeout
+            )
+            return []
         except Exception as exc:  # noqa: BLE001 - one bad search is [], never a crash
             self.ctx.logger.warning("Prowlarr search failed: %s", exc)
             return []
 
         min_seeders = self._min_seeders()
         scored = []
-        for release in releases if isinstance(releases, list) else []:
-            if str(release.get("protocol", "torrent")).lower() != "torrent":
+        skipped = {"usenet": 0, "no link": 0, "seeders": 0}
+        for release in releases:
+            if str(release.get("protocol") or "torrent").lower() != "torrent":
+                skipped["usenet"] += 1
                 continue
-            seeders = int(release.get("seeders") or 0)
             link = release.get("magnetUrl") or release.get("downloadUrl") or ""
-            if not link or seeders < min_seeders:
+            if not link:
+                skipped["no link"] += 1
+                continue
+            # Some indexers report no seeder count at all: keep those (unknown, not zero).
+            seeders = release.get("seeders")
+            if seeders is not None and int(seeders) < min_seeders:
+                skipped["seeders"] += 1
                 continue
             title = str(release.get("title") or "")
-            score = self.ctx.scoring.album_match(artist_name or "", album_title or "", title)
+            score = self.ctx.scoring.album_match(artist, album, title)
             if year and str(year) in title:
                 score += 0.05
+            score = min(score, 1.0)
             scored.append(
                 (
-                    min(score, 1.0),
-                    seeders,
+                    score,
+                    int(seeders or 0),
                     PluginSearchResult(
                         title=title,
                         size_bytes=int(release.get("size") or 0),
-                        score=round(min(score, 1.0), 4),
+                        score=round(score, 4),
                         quality_tier=quality_tier(title),
                         payload=link,
                     ),
                 )
             )
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        self.ctx.logger.info(
+            "Prowlarr: %d release(s) -> %d usable for %r (skipped: %s)",
+            len(releases), len(scored), f"{artist} - {album}", skipped,
+        )
         return [IndexerResult(source=SOURCE, plugin=item[2]) for item in scored[:MAX_RESULTS]]
 
     async def search_track(
