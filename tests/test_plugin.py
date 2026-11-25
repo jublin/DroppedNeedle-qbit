@@ -25,9 +25,16 @@ class FakeQBit:
         self.cookie_name = "SID"
         self.api_key = ""
 
-    async def request(self, method, url, *, params=None, data=None, headers=None, timeout=30.0):
+    async def request(self, method, url, *, params=None, data=None, content=None, headers=None, timeout=30.0):
         path = url.split("/api/v2/", 1)[1]
         form = {k: v for k, v in (data or {}).items()}
+        if content:  # multipart: fields as name=value, file as bytes
+            import re as _re
+
+            text = content.decode("latin-1")
+            for name, value in _re.findall(r'name="(\w+)"\r\n\r\n([^\r]*)\r\n', text):
+                form[name] = value
+            form["_file"] = content
         self.calls.append((method, path, {**(params or {}), **form, "_headers": headers or {}}))
         if path == "auth/login":
             if not self.login_ok:
@@ -47,7 +54,7 @@ class FakeQBit:
             return Response(200, {}, b"", url)
         if path == "torrents/add":
             if self.add_result == "Ok.":
-                self.torrents[HASH] = {
+                self.torrents[form.get("_hash", HASH)] = {
                     "hash": HASH,
                     "state": "downloading",
                     "progress": 0.5,

@@ -56,7 +56,7 @@ async def test_search_ranks_filters_and_tiers():
         "Other Band - Other",
     ]
     assert found[0].quality_tier == "mp3_320" and found[1].quality_tier == "lossless"
-    assert found[0].payload.startswith("http://prowlarr") and found[1].payload.startswith("magnet:")
+    assert found[0].payload.startswith("prowlarr:") and found[1].payload.startswith("magnet:")
     assert found[0].score == found[1].score == 1.0 and found[2].score < 0.5
     assert all(r.source == "plugin:qbittorrent" for r in results)
 
@@ -149,3 +149,18 @@ def test_score_rejects_wrong_album_and_collections():
     assert score_release("Artist", "Album", "Artist - Other Record FLAC") < 0.7
     assert score_release("Artist", "Album", "Artist - Discography FLAC") < 0.7
     assert score_release("Artist", "Album", "Artist - Album + 5 albums Discography") < 0.7
+
+
+async def test_payload_is_stable_across_searches():
+    n = {"i": 0}
+
+    async def handler(url, kw):
+        n["i"] += 1  # Prowlarr issues a fresh download link on every search
+        rel = [{"title": "Artist - Album FLAC", "guid": "g1", "indexerId": 4, "seeders": 5,
+                "protocol": "torrent", "downloadUrl": f"http://prowlarr/4/download?link=tok{n['i']}"}]
+        return Response(200, {}, json.dumps(rel).encode(), url)
+
+    plugin, _ = make(handler=handler)
+    first = (await plugin.search_album("Artist", "Album"))[0].plugin.payload
+    second = (await plugin.search_album("Artist", "Album"))[0].plugin.payload
+    assert first == second and first.startswith("prowlarr:")

@@ -35,8 +35,10 @@ settings.
 ## How it works
 
 - Only torrent results (not usenet) are returned; the payload is the magnet
-  link, or Prowlarr's `.torrent` download URL when there is none. In that case
-  qBittorrent must be able to reach the Prowlarr address you configured.
+  link, or a stable reference to the release when the indexer only offers a
+  `.torrent` file. At download time the plugin asks Prowlarr for a fresh link,
+  fetches the `.torrent` itself and uploads it to qBittorrent, so qBittorrent
+  never needs to reach Prowlarr and no API key is stored in a link.
 - Another indexer plugin can still feed this client: set its
   `target_source = "plugin:qbittorrent"` and put a magnet link or `.torrent`
   URL in the result payload.
