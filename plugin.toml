@@ -1,16 +1,41 @@
 [plugin]
 name = "qbittorrent"
-display_name = "qBittorrent"
-version = "1.0.0"
+display_name = "Prowlarr + qBittorrent"
+version = "1.1.0"
 api_version = 2
 entrypoint = "plugin:QBittorrent"
-capabilities = ["download_client"]
-description = "Download client that sends torrents and magnet links to qBittorrent, in the music category."
+capabilities = ["download_client", "indexer"]
+description = "Searches torrent indexers through Prowlarr and downloads with qBittorrent, in the music category."
 author = "Justin Moore"
 
 [[capability]]
 id = "download_client"
 display_name = "qBittorrent"
+
+[[capability]]
+id = "indexer"
+target_source = "plugin:qbittorrent"
+
+[[settings]]
+key = "prowlarr_url"
+label = "Prowlarr URL"
+help = "e.g. http://prowlarr:9696. Leave empty to use only another indexer plugin. qBittorrent must be able to reach this address too when a result is a .torrent URL."
+
+[[settings]]
+key = "prowlarr_api_key"
+label = "Prowlarr API key"
+help = "Prowlarr > Settings > General > API Key."
+secret = true
+
+[[settings]]
+key = "prowlarr_categories"
+label = "Prowlarr categories"
+help = "Comma-separated Newznab category ids to search. Defaults to 3000 (Audio)."
+
+[[settings]]
+key = "min_seeders"
+label = "Minimum seeders"
+help = "Results with fewer seeders are dropped. Defaults to 1."
 
 [[settings]]
 key = "url"
