@@ -13,8 +13,11 @@ from qBittorrent when the torrent completes.
 
 import asyncio
 import base64
+import hashlib
+import json
 import re
 import unicodedata
+import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -89,6 +92,68 @@ def score_release(artist: str, album: str, title: str, year: int | None = None) 
     if year and str(year) in (title or ""):
         score += 0.05
     return round(min(score, 1.0), 4)
+
+
+REF_PREFIX = "prowlarr:"
+
+
+def encode_ref(release: dict) -> str:
+    """A payload that is the same on every search. Prowlarr's own download URLs
+    are not (each carries a fresh encrypted token), and DroppedNeedle re-finds
+    a picked release by its payload."""
+    ref = {"g": release.get("guid") or "", "i": release.get("indexerId"), "t": release.get("title") or ""}
+    raw = json.dumps(ref, separators=(",", ":"), sort_keys=True).encode()
+    return REF_PREFIX + base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def decode_ref(payload: str) -> dict:
+    raw = payload[len(REF_PREFIX):]
+    return json.loads(base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+
+
+def _bencode_end(data: bytes, pos: int) -> int:
+    """Index just past the bencoded value starting at ``pos``."""
+    kind = data[pos : pos + 1]
+    if kind == b"i":
+        return data.index(b"e", pos) + 1
+    if kind in (b"l", b"d"):
+        pos += 1
+        while data[pos : pos + 1] != b"e":
+            pos = _bencode_end(data, pos)
+        return pos + 1
+    colon = data.index(b":", pos)
+    return colon + 1 + int(data[pos:colon])
+
+
+def torrent_info_hash(data: bytes) -> str:
+    """Hex SHA-1 of a .torrent file's info dictionary, or '' if unreadable."""
+    try:
+        if data[:1] != b"d":
+            return ""
+        pos = 1
+        while data[pos : pos + 1] != b"e":
+            key_end = _bencode_end(data, pos)
+            key = data[data.index(b":", pos) + 1 : key_end]
+            value_end = _bencode_end(data, key_end)
+            if key == b"info":
+                return hashlib.sha1(data[key_end:value_end]).hexdigest()
+            pos = value_end
+    except (ValueError, IndexError):
+        pass
+    return ""
+
+
+def _multipart(fields: dict, file_field: str, filename: str, content: bytes) -> tuple[bytes, str]:
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, value in fields.items():
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{filename}"\r\n'
+        "Content-Type: application/x-bittorrent\r\n\r\n".encode() + content + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 def _query_variants(artist: str, album: str) -> list[str]:
@@ -192,7 +257,9 @@ class QBittorrent:
                     self._cookie = match.group(1)
         # No cookie with an "Ok." answer means authentication is bypassed.
 
-    async def _request(self, method: str, path: str, *, params=None, data=None, timeout: float = 30.0):
+    async def _request(
+        self, method: str, path: str, *, params=None, data=None, content=None, extra_headers=None, timeout: float = 30.0
+    ):
         base = self._base_url()
         if not base:
             raise DownloadFailure("qBittorrent URL is not configured", fault="local")
@@ -200,10 +267,16 @@ class QBittorrent:
             if self._cookie is None:
                 await self._login()
         for attempt in (1, 2):
-            headers = {"Referer": base, **self._auth_headers()}
+            headers = {"Referer": base, **self._auth_headers(), **(extra_headers or {})}
             try:
                 response = await self.ctx.http.request(
-                    method, f"{base}/api/v2/{path}", params=params, data=data, headers=headers, timeout=timeout
+                    method,
+                    f"{base}/api/v2/{path}",
+                    params=params,
+                    data=data,
+                    content=content,
+                    headers=headers,
+                    timeout=timeout,
                 )
             except OSError as exc:
                 raise DownloadFailure(f"cannot reach qBittorrent at {base}: {exc}", fault="local") from exc
@@ -392,10 +465,11 @@ class QBittorrent:
             if str(release.get("protocol") or "torrent").lower() != "torrent":
                 skipped["usenet"] += 1
                 continue
-            link = release.get("magnetUrl") or release.get("downloadUrl") or ""
-            if not link:
+            magnet = release.get("magnetUrl") or ""
+            if not magnet and not release.get("downloadUrl"):
                 skipped["no link"] += 1
                 continue
+            link = magnet or encode_ref(release)
             # Some indexers report no seeder count at all: keep those (unknown, not zero).
             seeders = release.get("seeders")
             if seeders is not None and int(seeders) < min_seeders:
@@ -437,19 +511,73 @@ class QBittorrent:
 
     # -- download client ------------------------------------------------
 
+    async def _resolve_ref(self, payload: str) -> tuple[str, bytes | None]:
+        """Turn a Prowlarr reference into (magnet, None) or ("", .torrent bytes)."""
+        try:
+            ref = decode_ref(payload)
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise DownloadFailure("unreadable Prowlarr reference in the result payload", fault="source") from exc
+        if not self._prowlarr_url():
+            raise DownloadFailure("Prowlarr is not configured", fault="local")
+        try:
+            releases = await self._prowlarr_search(ref.get("t") or "", [], 30.0)
+        except Exception as exc:  # noqa: BLE001
+            raise DownloadFailure(f"Prowlarr lookup failed: {exc}", fault="local") from exc
+        match = next(
+            (r for r in releases if (ref.get("g") and r.get("guid") == ref["g"])),
+            None,
+        ) or next(
+            (r for r in releases if r.get("title") == ref.get("t") and r.get("indexerId") == ref.get("i")),
+            None,
+        )
+        if match is None:
+            raise DownloadFailure("Prowlarr no longer lists this release", fault="source")
+        if match.get("magnetUrl"):
+            return match["magnetUrl"], None
+        try:
+            response = await self.ctx.http.get(
+                match["downloadUrl"],
+                headers={"X-Api-Key": self._setting("prowlarr_api_key")},
+                timeout=60.0,
+            )
+        except OSError as exc:
+            # A redirect to a magnet: link cannot be followed by urllib.
+            raise DownloadFailure(f"could not fetch the .torrent from Prowlarr: {exc}", fault="unknown") from exc
+        if response.status_code != 200 or response.content[:1] != b"d":
+            raise DownloadFailure(
+                f"Prowlarr did not return a torrent file (HTTP {response.status_code})", fault="source"
+            )
+        return "", response.content
+
     async def enqueue(self, request: EnqueueRequest) -> TaskHandle:
         payload = (request.payload or "").strip()
-        if not payload or not (payload.lower().startswith("magnet:") or urlsplit(payload).scheme in ("http", "https")):
+        is_ref = payload.startswith(REF_PREFIX)
+        if not payload or not (
+            is_ref or payload.lower().startswith("magnet:") or urlsplit(payload).scheme in ("http", "https")
+        ):
             raise DownloadFailure(
                 "qBittorrent needs a magnet link or .torrent URL in the result payload", fault="source"
             )
         category = self._category()
         tag = self._tag(request.task_id)
+        link, torrent = payload, None
+        if is_ref:
+            link, torrent = await self._resolve_ref(payload)
         await self._ensure_category(category)
 
-        response = await self._request(
-            "POST", "torrents/add", data={"urls": payload, "category": category, "tags": tag}, timeout=60.0
-        )
+        if torrent is not None:
+            body, content_type = _multipart(
+                {"category": category, "tags": tag}, "torrents", "release.torrent", torrent
+            )
+            response = await self._request(
+                "POST", "torrents/add", content=body, extra_headers={"Content-Type": content_type}, timeout=60.0
+            )
+            info_hash = torrent_info_hash(torrent)
+        else:
+            response = await self._request(
+                "POST", "torrents/add", data={"urls": link, "category": category, "tags": tag}, timeout=60.0
+            )
+            info_hash = self._magnet_hash(link)
         body = response.text.strip()
         if response.status_code == 415:
             raise DownloadFailure("qBittorrent rejected the torrent file", fault="source")
@@ -457,7 +585,6 @@ class QBittorrent:
             raise DownloadFailure(f"qBittorrent answered HTTP {response.status_code} to add", fault="unknown")
         if body.lower().startswith("fails"):
             # Most likely already in qBittorrent: adopt it instead of failing.
-            info_hash = self._magnet_hash(payload)
             if not info_hash or not await self._json("torrents/info", hashes=info_hash):
                 raise DownloadFailure("qBittorrent could not add the torrent (invalid link?)", fault="source")
             await self._request("POST", "torrents/addTags", data={"hashes": info_hash, "tags": tag})

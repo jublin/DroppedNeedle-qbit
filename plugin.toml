@@ -1,7 +1,7 @@
 [plugin]
 name = "qbittorrent"
 display_name = "Prowlarr + qBittorrent"
-version = "1.1.3"
+version = "1.2.0"
 api_version = 2
 entrypoint = "plugin:QBittorrent"
 capabilities = ["download_client", "indexer"]
@@ -19,7 +19,7 @@ target_source = "plugin:qbittorrent"
 [[settings]]
 key = "prowlarr_url"
 label = "Prowlarr URL"
-help = "e.g. http://prowlarr:9696. Leave empty to use only another indexer plugin. qBittorrent must be able to reach this address too when a result is a .torrent URL."
+help = "e.g. http://prowlarr:9696. Leave empty to use only another indexer plugin."
 
 [[settings]]
 key = "prowlarr_api_key"
