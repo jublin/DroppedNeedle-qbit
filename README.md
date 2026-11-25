@@ -68,3 +68,13 @@ skipped (usenet, no link, too few seeders). Check that:
 - the same query returns results in Prowlarr's own search page.
 
 Releases with no seeder count are kept; lower *Minimum seeders* to `0` for indexers that report zero.
+
+### "has no automatic candidate"
+
+DroppedNeedle re-runs the search itself and only downloads automatically a
+release scoring at least `preflight_score_auto_accept` (0.70 by default) that
+passes your quality, size and term settings. Releases between 0.50 and 0.70
+are offered for a manual pick only. The log line `Prowlarr: ... best: ...`
+lists the top scores; the plugin ignores edition tags like "(Deluxe Edition)",
+accents, `&`/`and` and "The" when scoring, and marks down discographies.
+A release that already failed for the same task is not retried.

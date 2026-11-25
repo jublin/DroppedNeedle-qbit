@@ -14,6 +14,7 @@ from qBittorrent when the torrent completes.
 import asyncio
 import base64
 import re
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -50,6 +51,44 @@ _TIERS = (
     ("mp3_192", re.compile(r"\bv2\b|\b192\b", re.I)),
     ("low", re.compile(r"\b(128|96|64)\b", re.I)),
 )
+
+
+_STOPWORDS = {"the", "a", "an", "and", "of"}
+_COLLECTION = re.compile(r"discograph|collection|complete|anthology|\bbox ?set\b|\bbest of\b|greatest hits", re.I)
+
+
+def _words(text: str, *, drop_stopwords: bool = False) -> set[str]:
+    """Lowercase, accent-free, '&'='and', apostrophes dropped."""
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(c for c in text if not unicodedata.combining(c)).casefold()
+    text = text.replace("&", " and ").replace("'", "").replace("\u2019", "")
+    words = {w for w in re.split(r"[^0-9a-z\u0400-\uffff]+", text) if w}
+    return words - _STOPWORDS if drop_stopwords and words - _STOPWORDS else words
+
+
+def score_release(artist: str, album: str, title: str, year: int | None = None) -> float:
+    """0-1 confidence that a release title is this artist's album.
+
+    Edition tags in the wanted album ("(Deluxe Edition)") are ignored, the
+    album counts more than the artist, and multi-album collections are
+    marked down when the wanted album is not itself one.
+    """
+    core_album = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", album or "") or album
+    found = _words(title)
+    wanted_artist = _words(artist, drop_stopwords=True)
+    wanted_album = _words(core_album, drop_stopwords=True)
+
+    def coverage(wanted: set[str]) -> float:
+        return len(wanted & found) / len(wanted) if wanted else 1.0
+
+    if not wanted_artist and not wanted_album:
+        return 0.0
+    score = 0.4 * coverage(wanted_artist) + 0.6 * coverage(wanted_album)
+    if _COLLECTION.search(title or "") and not _COLLECTION.search(album or ""):
+        score *= 0.6
+    if year and str(year) in (title or ""):
+        score += 0.05
+    return round(min(score, 1.0), 4)
 
 
 def _query_variants(artist: str, album: str) -> list[str]:
@@ -363,10 +402,7 @@ class QBittorrent:
                 skipped["seeders"] += 1
                 continue
             title = str(release.get("title") or "")
-            score = self.ctx.scoring.album_match(artist, album, title)
-            if year and str(year) in title:
-                score += 0.05
-            score = min(score, 1.0)
+            score = score_release(artist, album, title, year)
             scored.append(
                 (
                     score,
@@ -382,8 +418,9 @@ class QBittorrent:
             )
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
         self.ctx.logger.info(
-            "Prowlarr: %d release(s) -> %d usable for %r (skipped: %s)",
+            "Prowlarr: %d release(s) -> %d usable for %r (skipped: %s); best: %s",
             len(releases), len(scored), f"{artist} - {album}", skipped,
+            "; ".join(f"{item[0]:.2f} {item[2].title[:70]}" for item in scored[:3]) or "none",
         )
         return [IndexerResult(source=SOURCE, plugin=item[2]) for item in scored[:MAX_RESULTS]]
 

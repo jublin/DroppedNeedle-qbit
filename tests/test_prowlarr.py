@@ -126,3 +126,26 @@ async def test_retries_without_categories_when_empty():
     plugin, calls = make(handler=handler)
     results = await plugin.search_album("Artist", "Album")
     assert results and "categories" not in calls[-1][1]["params"]
+
+
+from plugin import score_release
+
+
+@pytest.mark.parametrize(
+    "artist,album,title,minimum",
+    [
+        ("Artist", "Album (Deluxe Edition)", "Artist - Album (2020) [FLAC]", 0.95),
+        ("Simon & Garfunkel", "Bookends", "Simon and Garfunkel - Bookends 1968 FLAC", 0.95),
+        ("The Beatles", "Abbey Road", "Beatles - Abbey Road [24-96 FLAC]", 0.95),
+        ("Sigur Rós", "Ágætis byrjun", "Sigur Ros - Agaetis Byrjun (1999) MP3 320", 0.4),
+        ("Guns N' Roses", "Appetite for Destruction", "Guns N Roses - Appetite For Destruction FLAC", 0.95),
+    ],
+)
+def test_score_accepts_real_titles(artist, album, title, minimum):
+    assert score_release(artist, album, title) >= minimum
+
+
+def test_score_rejects_wrong_album_and_collections():
+    assert score_release("Artist", "Album", "Artist - Other Record FLAC") < 0.7
+    assert score_release("Artist", "Album", "Artist - Discography FLAC") < 0.7
+    assert score_release("Artist", "Album", "Artist - Album + 5 albums Discography") < 0.7
