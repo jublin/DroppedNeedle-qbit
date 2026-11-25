@@ -100,3 +100,52 @@ async def test_search_track_is_empty():
 )
 def test_quality_tier(title, tier):
     assert quality_tier(title) == tier
+
+
+async def test_null_seeders_are_kept():
+    async def handler(url, kw):
+        rel = [{"title": "Artist - Album FLAC", "seeders": None, "protocol": "torrent", "magnetUrl": "magnet:?xt=urn:btih:" + "e" * 40}]
+        return Response(200, {}, json.dumps(rel).encode(), url)
+
+    plugin, _ = make(handler=handler)
+    results = await plugin.search_album("Artist", "Album")
+    assert [r.plugin.title for r in results] == ["Artist - Album FLAC"]
+
+
+async def test_cleaned_query_variant_is_searched():
+    plugin, calls = make()
+    await plugin.search_album("Artist", "Album (Deluxe Edition)")
+    assert sorted(kw["params"]["query"] for _, kw in calls) == ["Artist Album", "Artist Album (Deluxe Edition)"]
+
+
+async def test_retries_without_categories_when_empty():
+    async def handler(url, kw):
+        found = [] if kw["params"].get("categories") else RELEASES
+        return Response(200, {}, json.dumps(found).encode(), url)
+
+    plugin, calls = make(handler=handler)
+    results = await plugin.search_album("Artist", "Album")
+    assert results and "categories" not in calls[-1][1]["params"]
+
+
+from plugin import score_release
+
+
+@pytest.mark.parametrize(
+    "artist,album,title,minimum",
+    [
+        ("Artist", "Album (Deluxe Edition)", "Artist - Album (2020) [FLAC]", 0.95),
+        ("Simon & Garfunkel", "Bookends", "Simon and Garfunkel - Bookends 1968 FLAC", 0.95),
+        ("The Beatles", "Abbey Road", "Beatles - Abbey Road [24-96 FLAC]", 0.95),
+        ("Sigur Rós", "Ágætis byrjun", "Sigur Ros - Agaetis Byrjun (1999) MP3 320", 0.4),
+        ("Guns N' Roses", "Appetite for Destruction", "Guns N Roses - Appetite For Destruction FLAC", 0.95),
+    ],
+)
+def test_score_accepts_real_titles(artist, album, title, minimum):
+    assert score_release(artist, album, title) >= minimum
+
+
+def test_score_rejects_wrong_album_and_collections():
+    assert score_release("Artist", "Album", "Artist - Other Record FLAC") < 0.7
+    assert score_release("Artist", "Album", "Artist - Discography FLAC") < 0.7
+    assert score_release("Artist", "Album", "Artist - Album + 5 albums Discography") < 0.7
