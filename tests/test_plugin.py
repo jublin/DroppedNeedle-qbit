@@ -22,6 +22,8 @@ class FakeQBit:
         self.files: dict[str, list] = {}
         self.login_ok = True
         self.add_result = "Ok."
+        self.cookie_name = "SID"
+        self.api_key = ""
 
     async def request(self, method, url, *, params=None, data=None, headers=None, timeout=30.0):
         path = url.split("/api/v2/", 1)[1]
@@ -30,8 +32,11 @@ class FakeQBit:
         if path == "auth/login":
             if not self.login_ok:
                 return Response(200, {}, b"Fails.", url)
-            return Response(200, {"Set-Cookie": "SID=abc123; HttpOnly; path=/"}, b"Ok.", url)
-        if headers.get("Cookie") != "SID=abc123":
+            return Response(200, {"Set-Cookie": f"{self.cookie_name}=abc123; HttpOnly; path=/"}, b"Ok.", url)
+        if self.api_key:
+            if headers.get("Authorization") != f"Bearer {self.api_key}":
+                return Response(401, {}, b"", url)
+        elif headers.get("Cookie") != f"{self.cookie_name}=abc123":
             return Response(403, {}, b"Forbidden", url)
         if path == "app/version":
             return Response(200, {}, b"v5.0.1", url)
@@ -244,3 +249,24 @@ def test_magnet_hash_base32():
     raw = bytes(range(20))
     b32 = base64.b32encode(raw).decode()
     assert QBittorrent._magnet_hash(f"magnet:?xt=urn:btih:{b32}") == raw.hex()
+
+
+async def test_v5_cookie_name(plugin, qbit):
+    qbit.cookie_name = "QBT_SID_8080"
+    handle = await plugin.enqueue(_request())
+    assert handle.job_name == "droppedneedle-t1"
+
+
+async def test_api_key_skips_login(plugin, qbit):
+    qbit.api_key = "qbt_key"
+    plugin.ctx.settings["api_key"] = "qbt_key"
+    await plugin.enqueue(_request())
+    assert not any(c[1] == "auth/login" for c in qbit.calls)
+    assert (await plugin.health_check()).status == "ok"
+
+
+async def test_wrong_api_key_is_local_failure(plugin, qbit):
+    qbit.api_key = "right"
+    plugin.ctx.settings["api_key"] = "wrong"
+    status = await plugin.health_check()
+    assert status.status == "error" and "API key" in status.message

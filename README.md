@@ -25,6 +25,7 @@ settings.
 | Prowlarr categories | Newznab ids, default `3000` (Audio) |
 | Minimum seeders | Default `1` |
 | qBittorrent URL | Web UI address, e.g. `http://qbittorrent:8080` |
+| API key | qBittorrent API key (Options > WebUI), sent as a Bearer token; no login needed. Overrides username/password |
 | Username / Password | Web UI credentials (leave empty if auth is bypassed) |
 | Category | Defaults to `music` |
 | Downloads directory | Where DroppedNeedle sees qBittorrent's completed files. Finished files must be inside it |
