@@ -1,7 +1,7 @@
 [plugin]
 name = "qbittorrent"
 display_name = "Prowlarr + qBittorrent"
-version = "1.1.0"
+version = "1.1.1"
 api_version = 2
 entrypoint = "plugin:QBittorrent"
 capabilities = ["download_client", "indexer"]
@@ -43,9 +43,15 @@ label = "qBittorrent URL"
 help = "Web UI address, e.g. http://qbittorrent:8080"
 
 [[settings]]
+key = "api_key"
+label = "API key"
+help = "qBittorrent API key (Options > WebUI), if your version supports it. When set, the username and password are not used."
+secret = true
+
+[[settings]]
 key = "username"
 label = "Username"
-help = "Web UI username. Leave empty if localhost/subnet authentication is bypassed."
+help = "Web UI username. Leave empty if using an API key or if localhost/subnet authentication is bypassed."
 
 [[settings]]
 key = "password"

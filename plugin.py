@@ -67,7 +67,7 @@ def _text(value) -> str:
 class QBittorrent:
     def __init__(self, ctx):
         self.ctx = ctx
-        self._sid: str | None = None
+        self._cookie: str | None = None  # "NAME=value" session cookie
         self._login_lock = asyncio.Lock()
 
     # -- settings -------------------------------------------------------
@@ -101,10 +101,19 @@ class QBittorrent:
 
     # -- HTTP -----------------------------------------------------------
 
+    def _auth_headers(self) -> dict:
+        """API key (Bearer) when configured, else the session cookie from login."""
+        api_key = self._setting("api_key")
+        if api_key:
+            return {"Authorization": f"Bearer {api_key}"}
+        return {"Cookie": self._cookie} if self._cookie else {}
+
     async def _login(self) -> None:
         base = self._base_url()
         if not base:
             raise DownloadFailure("qBittorrent URL is not configured", fault="local")
+        if self._setting("api_key"):
+            return  # API keys need no login (and /auth/* rejects them)
         try:
             response = await self.ctx.http.post(
                 f"{base}/api/v2/auth/login",
@@ -117,13 +126,18 @@ class QBittorrent:
         if response.status_code == 403:
             raise DownloadFailure("qBittorrent refused the login (IP banned after failed attempts?)", fault="local")
         if response.status_code != 200 or response.text.strip().lower().startswith("fails"):
-            raise DownloadFailure("qBittorrent login failed: check the username and password", fault="local")
-        self._sid = None
+            raise DownloadFailure(
+                f"qBittorrent login failed (HTTP {response.status_code}: {response.text.strip()[:60]!r}); "
+                "check the username and password, or use an API key",
+                fault="local",
+            )
+        self._cookie = None
         for key, value in response.headers.items():
             if key.lower() == "set-cookie":
-                match = re.search(r"SID=([^;]+)", value)
+                # "SID" on v4, "QBT_SID_<port>" on v5.
+                match = re.match(r"\s*((?:QBT_)?SID[A-Za-z0-9_]*=[^;]+)", value)
                 if match:
-                    self._sid = match.group(1)
+                    self._cookie = match.group(1)
         # No cookie with an "Ok." answer means authentication is bypassed.
 
     async def _request(self, method: str, path: str, *, params=None, data=None, timeout: float = 30.0):
@@ -131,22 +145,22 @@ class QBittorrent:
         if not base:
             raise DownloadFailure("qBittorrent URL is not configured", fault="local")
         async with self._login_lock:
-            if self._sid is None:
+            if self._cookie is None:
                 await self._login()
         for attempt in (1, 2):
-            headers = {"Referer": base}
-            if self._sid:
-                headers["Cookie"] = f"SID={self._sid}"
+            headers = {"Referer": base, **self._auth_headers()}
             try:
                 response = await self.ctx.http.request(
                     method, f"{base}/api/v2/{path}", params=params, data=data, headers=headers, timeout=timeout
                 )
             except OSError as exc:
                 raise DownloadFailure(f"cannot reach qBittorrent at {base}: {exc}", fault="local") from exc
-            if response.status_code == 403 and attempt == 1:
+            if response.status_code == 403 and attempt == 1 and not self._setting("api_key"):
                 async with self._login_lock:
                     await self._login()
                 continue
+            if response.status_code in (401, 403) and self._setting("api_key"):
+                raise DownloadFailure("qBittorrent rejected the API key", fault="local")
             return response
         return response  # pragma: no cover
 
